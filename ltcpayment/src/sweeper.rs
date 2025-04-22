@@ -4,14 +4,17 @@ use crate::{
 };
 use anyhow::Result;
 use bech32::{decode, FromBase32};
-use bitcoin::util::address::WitnessVersion;
+use bitcoin::Witness;
 use bitcoin::{
     blockdata::{script::Script, transaction::OutPoint},
-    util::psbt::serialize::Serialize,
-    SigHashType, Transaction, TxIn, TxOut, Txid,
+    util::{psbt::serialize::Serialize, sighash::SighashCache},
+    PubkeyHash, SigHashType, Transaction, TxIn, TxOut, Txid,
 };
-use secp256k1::{PublicKey, Secp256k1};
-use std::str::FromStr;
+use bitcoin::{hashes::Hash, util::address::WitnessVersion};
+use ripemd::Ripemd160;
+use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use sha2::{Digest, Sha256};
+use std::str::{FromStr};
 use tokio::{
     spawn,
     time::{interval, Duration},
@@ -19,8 +22,21 @@ use tokio::{
 
 fn addr_to_script(addr: &str) -> Script {
     let (_, data, _) = decode(addr).expect("bech32 decode");
-    let prog = Vec::<u8>::from_base32(&data).expect("base32 decode");
+    let (_, prog5) = data.split_first().expect("empty data"); // skip witness version byte
+    let prog = Vec::<u8>::from_base32(prog5).expect("base32 decode");
     Script::new_witness_program(WitnessVersion::V0, &prog)
+}
+
+fn hash160(data: &[u8]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&Ripemd160::digest(&Sha256::digest(data)));
+    out
+}
+
+fn p2pkh_script_code(pk: &PublicKey) -> Script {
+    let h = hash160(&pk.serialize());
+    let pubkey_hash = PubkeyHash::from_slice(&h).expect("valid hash160");
+    Script::new_p2pkh(&pubkey_hash)
 }
 
 /// Launch the background sweeper.
@@ -53,7 +69,9 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         &[script_hash(&p.address).into()],
     )?;
 
-    let main_script = addr_to_script("ltc1qf00w70ek4tyzgpfjpenadtjys8k2mhw7t92adp");
+    let main_address =
+        std::env::var("MAIN_ADDRESS").expect("MAIN_ADDRESS must be set in environment variables");
+    let main_script = addr_to_script(&main_address);
     let mut total = 0u64;
     let mut tx = Transaction {
         version: 2,
@@ -65,15 +83,18 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         }],
     };
 
+    let mut prev_values = Vec::new();
     for u in utxos.as_array().unwrap() {
-        total += u["value"].as_u64().unwrap();
+        let val = u["value"].as_u64().unwrap();
+        total += val;
+        prev_values.push(val);
         let txid = Txid::from_str(u["tx_hash"].as_str().unwrap())?;
         let vout = u["tx_pos"].as_u64().unwrap() as u32;
         tx.input.push(TxIn {
             previous_output: OutPoint::new(txid, vout),
             script_sig: Script::new(),
             sequence: 0xffffffff,
-            witness: bitcoin::Witness::default(),
+            witness: Witness::default(),
         });
     }
 
@@ -83,18 +104,22 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     }
     tx.output[0].value = total - fee;
 
-    let sk = secp256k1::SecretKey::from_str(&decrypt_wif(&p.wif_enc))?;
+    // our stored key is raw hex, not WIF
+    let sk_hex = decrypt_wif(&p.wif_enc);
+    let sk = SecretKey::from_str(&sk_hex)?;
     let secp = Secp256k1::new();
     let pk = PublicKey::from_secret_key(&secp, &sk);
 
-    for i in 0..tx.input.len() {
-        let sighash = tx.signature_hash(i, &Script::new(), SigHashType::All as u32);
-        let sig = secp.sign_ecdsa(&secp256k1::Message::from_slice(&sighash)?, &sk);
-
-        let mut with_type = sig.serialize_der().to_vec();
-        with_type.push(SigHashType::All as u8);
-
-        tx.input[i].witness.push(with_type);
+    for (i, prev_value) in prev_values.iter().enumerate() {
+        let script_code = p2pkh_script_code(&pk);
+        let sighash = {
+            let mut cache = SighashCache::new(&mut tx);
+            cache.segwit_signature_hash(i, &script_code, *prev_value, SigHashType::All)?
+        };
+        let msg = secp256k1::Message::from_slice(&sighash[..])?;
+        let mut sig = secp.sign_ecdsa(&msg, &sk).serialize_der().to_vec();
+        sig.push(SigHashType::All.to_u32() as u8);
+        tx.input[i].witness.push(sig);
         tx.input[i].witness.push(pk.serialize().to_vec());
     }
 
