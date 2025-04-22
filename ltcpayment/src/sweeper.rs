@@ -14,7 +14,7 @@ use bitcoin::{hashes::Hash, util::address::WitnessVersion};
 use ripemd::Ripemd160;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
-use std::str::FromStr;
+use std::{env, str::FromStr};
 use tokio::{
     spawn,
     time::{interval, Duration},
@@ -22,7 +22,7 @@ use tokio::{
 
 fn addr_to_script(addr: &str) -> Script {
     let (_, data, _) = decode(addr).expect("bech32 decode");
-    let (_, prog5) = data.split_first().expect("empty data"); // skip witness version byte
+    let (_, prog5) = data.split_first().expect("empty data");
     let prog = Vec::<u8>::from_base32(prog5).expect("base32 decode");
     Script::new_witness_program(WitnessVersion::V0, &prog)
 }
@@ -55,6 +55,33 @@ pub async fn start(db: Db) {
 }
 
 async fn process(db: &Db, p: &Payment) -> Result<()> {
+    // First check confirmations
+    let hist = crate::electrum::rpc(
+        "blockchain.scripthash.get_history",
+        &[script_hash(&p.address).into()],
+    )?;
+    let hdr = crate::electrum::rpc("blockchain.headers.subscribe", &[])?;
+    let tip = hdr["height"].as_u64().unwrap_or(0);
+
+    // For a single-payment address, min block height across all txs in history is enough
+    let confirmations = hist.as_array().unwrap()
+        .iter()
+        .filter(|h| h["height"].as_u64().unwrap_or(0) > 0)
+        .map(|h| tip - h["height"].as_u64().unwrap() + 1)
+        .min()
+        .unwrap_or(0);
+
+    let needed = env::var("CONFIRMATIONS")
+        .unwrap_or_else(|_| "2".to_string())
+        .parse::<u64>()
+        .unwrap_or(2);
+
+    if confirmations < needed {
+        // Not enough confirmations yet; skip
+        return Ok(());
+    }
+
+    // Now check if the confirmed balance meets or exceeds `p.amount`
     let bal = crate::electrum::rpc(
         "blockchain.scripthash.get_balance",
         &[script_hash(&p.address).into()],
@@ -64,13 +91,13 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         return Ok(());
     }
 
+    // Collect UTXOs and sweep
     let utxos = crate::electrum::rpc(
         "blockchain.scripthash.listunspent",
         &[script_hash(&p.address).into()],
     )?;
 
-    let main_address =
-        std::env::var("MAIN_ADDRESS").expect("MAIN_ADDRESS must be set in environment variables");
+    let main_address = env::var("MAIN_ADDRESS").expect("MAIN_ADDRESS must be set");
     let main_script = addr_to_script(&main_address);
     let mut total = 0u64;
     let mut tx = Transaction {
@@ -99,12 +126,9 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     }
 
     let fee = crate::electrum::fee_sat(tx.vsize() as u64 + 68);
-    if total <= fee {
-        return Ok(());
-    }
+    if total <= fee { return Ok(()); }
     tx.output[0].value = total - fee;
 
-    // our stored key is raw hex, not WIF
     let sk_hex = decrypt_wif(&p.wif_enc);
     let sk = SecretKey::from_str(&sk_hex)?;
     let secp = Secp256k1::new();
