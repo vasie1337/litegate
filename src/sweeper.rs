@@ -1,6 +1,5 @@
 use crate::{
-    db::Db,
-    db::Payment,
+    db::{Db, Payment},
     electrum::{fee_sat_async, rpc_async},
     utils::{decrypt_wif, script_hash},
 };
@@ -27,9 +26,9 @@ use tokio::{
 };
 
 fn addr_to_script(addr: &str) -> Script {
-    let (_, data, _) = decode(addr).expect("bech32 decode");
-    let (_, prog5) = data.split_first().expect("empty data");
-    let prog = Vec::<u8>::from_base32(prog5).expect("base32 decode");
+    let (_, data, _) = decode(addr).unwrap();
+    let (_, prog5) = data.split_first().unwrap();
+    let prog = Vec::<u8>::from_base32(prog5).unwrap();
     Script::new_witness_program(WitnessVersion::V0, &prog)
 }
 
@@ -59,13 +58,11 @@ pub async fn start(db: Db) {
 }
 
 async fn process(db: &Db, p: &Payment) -> Result<()> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     if p.status == "pending" && p.expires_at != 0 && p.expires_at < now {
         db.mark_expired(&p.id)?;
     }
+
     let hist = rpc_async(
         "blockchain.scripthash.get_history",
         &[script_hash(&p.address).into()],
@@ -81,23 +78,31 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         .map(|h| tip - h["height"].as_u64().unwrap() + 1)
         .min()
         .unwrap_or(0);
+
     let needed = env::var("CONFIRMATIONS")
-        .unwrap_or_else(|_| "2".to_string())
+        .unwrap_or_else(|_| "2".into())
         .parse::<u64>()
         .unwrap_or(2);
     if confirmations < needed {
         return Ok(());
     }
+
     let bal = rpc_async(
         "blockchain.scripthash.get_balance",
         &[script_hash(&p.address).into()],
     )
     .await?;
-    let target_sat = (p.amount * 1e8) as u64;
     let confirmed_balance = bal["confirmed"].as_u64().unwrap_or(0);
-    if confirmed_balance < target_sat {
+
+    let sweep_threshold = if p.status == "pending" {
+        (p.amount * 1e8) as u64
+    } else {
+        1
+    };
+    if confirmed_balance < sweep_threshold {
         return Ok(());
     }
+
     let utxos = rpc_async(
         "blockchain.scripthash.listunspent",
         &[script_hash(&p.address).into()],
@@ -105,6 +110,7 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     .await?;
     let main_address = env::var("MAIN_ADDRESS").unwrap();
     let main_script = addr_to_script(&main_address);
+
     let mut total = 0u64;
     let mut tx = Transaction {
         version: 2,
@@ -129,15 +135,18 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
             witness: Witness::default(),
         });
     }
+
     let fee = fee_sat_async(tx.vsize() as u64 + 68).await;
     if total <= fee {
         return Ok(());
     }
     tx.output[0].value = total - fee;
+
     let sk_hex = decrypt_wif(&p.wif_enc);
     let sk = SecretKey::from_str(&sk_hex)?;
     let secp = Secp256k1::new();
     let pk = PublicKey::from_secret_key(&secp, &sk);
+
     for (i, prev_value) in prev_values.iter().enumerate() {
         let script_code = p2pkh_script_code(&pk);
         let sighash = {
@@ -150,7 +159,8 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         tx.input[i].witness.push(sig);
         tx.input[i].witness.push(pk.serialize().to_vec());
     }
-    let _ = rpc_async(
+
+    rpc_async(
         "blockchain.transaction.broadcast",
         &[hex::encode(tx.serialize()).into()],
     )

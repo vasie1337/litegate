@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tracing::instrument;
@@ -19,14 +19,14 @@ pub struct Payment {
 }
 
 impl Db {
-    #[instrument(skip(path), err)]
-    pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
+    #[instrument(skip(path))]
+    pub fn open(path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS payments(
                 id TEXT PRIMARY KEY,
                 address TEXT UNIQUE,
-                wif_enc TEXT,
+                wif_enc TEXT NOT NULL,
                 amount REAL,
                 status TEXT,
                 created_at INTEGER,
@@ -40,10 +40,8 @@ impl Db {
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 
-    #[instrument(skip(self, p), fields(payment_id = %p.id))]
     pub fn insert(&self, p: &Payment) -> SqliteResult<()> {
-        let c = self.0.lock().unwrap();
-        c.execute(
+        self.0.lock().unwrap().execute(
             "INSERT INTO payments(id,address,wif_enc,amount,status,created_at,updated_at,expires_at)
              VALUES(?,?,?,?,?,strftime('%s','now'),strftime('%s','now'),?)",
             params![p.id, p.address, p.wif_enc, p.amount, "pending", p.expires_at],
@@ -51,10 +49,9 @@ impl Db {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(payment_id = %id))]
     pub fn find(&self, id: &str) -> SqliteResult<Option<Payment>> {
         let c = self.0.lock().unwrap();
-        let result = c.query_row(
+        c.query_row(
             "SELECT id,address,wif_enc,amount,status,created_at,updated_at,expires_at
              FROM payments WHERE id=?",
             [id],
@@ -70,20 +67,17 @@ impl Db {
                     expires_at: r.get(7)?,
                 })
             },
-        );
-        match result {
-            Ok(p) => Ok(Some(p)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+        )
+        .optional()
     }
 
     pub fn all(&self) -> SqliteResult<Vec<Payment>> {
         let c = self.0.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT id,address,wif_enc,amount,status,created_at,updated_at,expires_at FROM payments",
+            "SELECT id,address,wif_enc,amount,status,created_at,updated_at,expires_at
+             FROM payments",
         )?;
-        let payments = stmt
+        let rows = stmt
             .query_map([], |r| {
                 Ok(Payment {
                     id: r.get(0)?,
@@ -97,22 +91,26 @@ impl Db {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(payments)
+        Ok(rows)
     }
 
     pub fn mark_completed(&self, id: &str) -> SqliteResult<()> {
-        let c = self.0.lock().unwrap();
-        c.execute(
-            "UPDATE payments SET status='completed',updated_at=strftime('%s','now') WHERE id=?",
+        self.0.lock().unwrap().execute(
+            "UPDATE payments
+             SET status='completed',
+                 updated_at=strftime('%s','now')
+             WHERE id=?",
             [id],
         )?;
         Ok(())
     }
 
     pub fn mark_expired(&self, id: &str) -> SqliteResult<()> {
-        let c = self.0.lock().unwrap();
-        c.execute(
-            "UPDATE payments SET status='expired',updated_at=strftime('%s','now') WHERE id=? AND status='pending'",
+        self.0.lock().unwrap().execute(
+            "UPDATE payments
+             SET status='expired',
+                 updated_at=strftime('%s','now')
+             WHERE id=? AND status='pending'",
             [id],
         )?;
         Ok(())
