@@ -47,10 +47,16 @@ fn p2pkh_script_code(pk: &PublicKey) -> Script {
 pub async fn start(db: Db) {
     spawn(async move {
         let mut iv = interval(Duration::from_secs(10));
+        let mut cycle: u64 = 0;
         loop {
             iv.tick().await;
+            cycle += 1;
             let payments = db.all().unwrap_or_default();
             for p in &payments {
+                let cold = p.status != "pending";
+                if cold && cycle % 360 != 0 {
+                    continue;
+                }
                 let _ = process(&db, p).await;
             }
         }
