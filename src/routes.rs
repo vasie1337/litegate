@@ -6,14 +6,14 @@ use crate::{
 use actix_web::{web, HttpResponse};
 use serde::Deserialize;
 use serde_json::json;
-use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::spawn_blocking;
-use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
 
 #[derive(Deserialize, Debug)]
 struct PayReq {
     amount: f64,
+    ttl: u64,
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
@@ -21,20 +21,15 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         .service(web::resource("/payments/{id}").route(web::get().to(get_payment)));
 }
 
-#[instrument(skip(db))]
 async fn create_payment(db: web::Data<Db>, req: web::Json<PayReq>) -> HttpResponse {
     if req.amount <= 0.0 {
-        debug!(
-            "Rejected payment request with invalid amount: {}",
-            req.amount
-        );
         return HttpResponse::BadRequest().finish();
     }
-
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let expires_at = if req.ttl == 0 { 0 } else { now + req.ttl as i64 };
     let id = Uuid::new_v4().to_string();
     let (_, wif, addr) = new_key();
     let wif_enc = encrypt_wif(&wif);
-
     let payment = Payment {
         id: id.clone(),
         address: addr.clone(),
@@ -43,53 +38,40 @@ async fn create_payment(db: web::Data<Db>, req: web::Json<PayReq>) -> HttpRespon
         status: "pending".into(),
         created_at: 0,
         updated_at: 0,
+        expires_at,
     };
-
-    // DB insert offloaded to blocking thread
     let db_clone = db.clone();
     let payment_clone = payment.clone();
-    if let Err(e) = spawn_blocking(move || db_clone.insert(&payment_clone))
+    if spawn_blocking(move || db_clone.insert(&payment_clone))
         .await
-        .expect("blocking task panicked")
+        .unwrap()
+        .is_err()
     {
-        error!("DB insert error: {}", e);
         return HttpResponse::InternalServerError().finish();
     }
-
-    info!("Created new payment: id={}, address={}", id, addr);
-    HttpResponse::Ok().json(json!({ "id": id, "address": addr, "amount": req.amount }))
+    HttpResponse::Ok().json(json!({
+        "id": id,
+        "address": addr,
+        "amount": req.amount,
+        "expires_at": expires_at
+    }))
 }
 
-#[instrument(skip(db))]
 async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse {
     let payment_id = path.into_inner();
-    debug!("Looking up payment with id: {}", payment_id);
-
-    // DB lookup offloaded to blocking thread
     let db_clone = db.clone();
-    let payment_id_clone = payment_id.clone();
-    let payment_res = spawn_blocking(move || db_clone.find(&payment_id_clone))
+    let payment_opt = spawn_blocking(move || db_clone.find(&payment_id))
         .await
-        .expect("blocking task panicked");
-
-    let payment_opt = match payment_res {
-        Ok(p) => p,
-        Err(e) => {
-            error!("DB lookup error: {}", e);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
-    let Some(payment) = payment_opt else {
-        debug!("Payment not found: {}", payment_id);
+        .unwrap()
+        .unwrap_or(None);
+    let Some(mut payment) = payment_opt else {
         return HttpResponse::NotFound().finish();
     };
-
-    debug!(
-        "Fetching blockchain information for address: {}",
-        payment.address
-    );
-
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    if payment.status == "pending" && payment.expires_at != 0 && payment.expires_at < now {
+        let _ = db.mark_expired(&payment.id);
+        payment.status = "expired".into();
+    }
     let bal = match rpc_async(
         "blockchain.scripthash.get_balance",
         &[script_hash(&payment.address).into()],
@@ -97,20 +79,12 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
     .await
     {
         Ok(v) => v,
-        Err(e) => {
-            error!("Electrum error getting balance: {:?}", e);
-            return HttpResponse::BadGateway().body("electrum error");
-        }
+        Err(_) => return HttpResponse::BadGateway().finish(),
     };
-
     let hdr = match rpc_async("blockchain.headers.subscribe", &[]).await {
         Ok(v) => v,
-        Err(e) => {
-            error!("Electrum error subscribing to headers: {:?}", e);
-            return HttpResponse::BadGateway().body("electrum error");
-        }
+        Err(_) => return HttpResponse::BadGateway().finish(),
     };
-
     let hist = match rpc_async(
         "blockchain.scripthash.get_history",
         &[script_hash(&payment.address).into()],
@@ -118,12 +92,8 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
     .await
     {
         Ok(v) => v,
-        Err(e) => {
-            error!("Electrum error getting history: {:?}", e);
-            return HttpResponse::BadGateway().body("electrum error");
-        }
+        Err(_) => return HttpResponse::BadGateway().finish(),
     };
-
     let tip = hdr["height"].as_u64().unwrap_or(0);
     let confirmations = hist
         .as_array()
@@ -133,22 +103,9 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
         .map(|h| tip - h["height"].as_u64().unwrap() + 1)
         .min()
         .unwrap_or(0);
-
-    // Show total received (confirmed + unconfirmed) so user sees pending funds
     let confirmed_sat = bal["confirmed"].as_i64().unwrap_or(0).max(0) as f64;
     let unconfirmed_sat = bal["unconfirmed"].as_i64().unwrap_or(0).max(0) as f64;
     let received = (confirmed_sat + unconfirmed_sat) / 1e8;
-
-    let confirmations_needed = env::var("CONFIRMATIONS")
-        .unwrap_or_else(|_| "2".to_string())
-        .parse::<u64>()
-        .unwrap_or(2);
-
-    info!(
-        "Payment info: id={}, address={}, confirmations={}/{}",
-        payment.id, payment.address, confirmations, confirmations_needed
-    );
-
     HttpResponse::Ok().json(json!({
         "id": payment.id,
         "address": payment.address,
@@ -156,8 +113,8 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
         "status": payment.status,
         "created_at": payment.created_at,
         "updated_at": payment.updated_at,
+        "expires_at": payment.expires_at,
         "confirmations": confirmations,
-        "confirmations_needed": confirmations_needed,
         "received": received,
     }))
 }
