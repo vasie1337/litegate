@@ -1,16 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use electrum_client::{Client, ConfigBuilder, ElectrumApi, Param};
 use lazy_static::lazy_static;
-use log::{debug, error, info, trace};
 use serde_json::Value;
 use std::{sync::Mutex, thread, time::Duration};
+use tracing::{debug, error, info, trace, Level};
 
-/// Initialise `env_logger` once.
-fn init_logger() {
+/// Initialize tracing subscriber once.
+fn init_tracing() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
-            .format_timestamp_millis()
+        tracing_subscriber::fmt()
+            .with_max_level(Level::TRACE)
+            .with_timer(tracing_subscriber::fmt::time::time())
             .init();
     });
 }
@@ -18,7 +19,7 @@ fn init_logger() {
 /// Open a single connection (`scheme://host:port`) and perform `server.version`.
 fn connect_once(host: &str, port: &str, scheme: &str) -> Result<Client> {
     let url = format!("{scheme}://{host}:{port}");
-    debug!("connecting to {url}");
+    debug!(url = %url, "connecting");
 
     let cfg = ConfigBuilder::new()
         .timeout(Some(15))
@@ -28,7 +29,7 @@ fn connect_once(host: &str, port: &str, scheme: &str) -> Result<Client> {
 
     let c = Client::from_config(&url, cfg).with_context(|| format!("dial {url}"))?;
 
-    debug!("handshaking with {url}");
+    debug!(url = %url, "handshaking");
     c.raw_call(
         "server.version",
         vec![
@@ -38,7 +39,7 @@ fn connect_once(host: &str, port: &str, scheme: &str) -> Result<Client> {
     )
     .with_context(|| format!("handshake {url}"))?;
 
-    info!("electrum ready {url}");
+    info!(url = %url, "electrum ready");
     Ok(c)
 }
 
@@ -49,12 +50,12 @@ fn fresh_client() -> Result<Client> {
     let port = "50001";
     let scheme = "tcp";
 
-    debug!("Using fixed connection: {scheme}://{host}:{port}");
+    debug!(scheme = %scheme, host = %host, port = %port, "Using fixed connection");
 
     match connect_once(host, port, scheme) {
         Ok(c) => Ok(c),
         Err(e) => {
-            error!("{scheme}://{host}:{port} failed: {e:?}");
+            error!(scheme = %scheme, host = %host, port = %port, error = ?e, "connection failed");
             Err(anyhow!("connection to {scheme}://{host}:{port} failed").context(e))
         }
     }
@@ -65,7 +66,7 @@ lazy_static! {
 }
 
 fn client() -> Result<&'static Mutex<Option<Client>>> {
-    init_logger();
+    init_tracing();
     if ECL.lock().unwrap().is_none() {
         *ECL.lock().unwrap() = Some(fresh_client()?);
     }
@@ -107,14 +108,14 @@ pub fn rpc(method: &str, params: &[Value]) -> Result<Value> {
             *guard = Some(fresh_client()?);
         }
 
-        trace!("rpc attempt {attempt}/3: {method} {params:?}");
+        trace!(method = %method, params = ?params, attempt = attempt, "rpc attempt");
         match guard.as_mut().unwrap().raw_call(method, to_params(params)) {
             Ok(v) => {
-                debug!("rpc {method} ok");
+                debug!(method = %method, "rpc success");
                 return Ok(v);
             }
             Err(e) => {
-                error!("rpc {method} failed ({attempt}/3): {e:?}");
+                error!(method = %method, attempt = attempt, error = ?e, "rpc failed");
                 *guard = None; // drop broken connection
                 drop(guard);
                 if attempt < 3 {

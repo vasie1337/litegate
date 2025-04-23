@@ -19,6 +19,7 @@ use tokio::{
     spawn,
     time::{interval, Duration},
 };
+use tracing::{debug, error, info, instrument};
 
 fn addr_to_script(addr: &str) -> Script {
     let (_, data, _) = decode(addr).expect("bech32 decode");
@@ -41,19 +42,29 @@ fn p2pkh_script_code(pk: &PublicKey) -> Script {
 
 /// Launch the background sweeper.
 pub async fn start(db: Db) {
+    info!("Starting background sweeper");
     spawn(async move {
         let mut iv = interval(Duration::from_secs(10));
         loop {
             iv.tick().await;
-            for p in db.all() {
-                if let Err(e) = process(&db, &p).await {
-                    eprintln!("[Sweeper] {} {}", p.id, e);
+            debug!("Sweeper tick - checking payments");
+            let payments = match db.all() {
+                Ok(payments) => payments,
+                Err(e) => {
+                    error!("Failed to fetch payments: {}", e);
+                    Vec::new()
+                }
+            };
+            for payment in &payments {
+                if let Err(e) = process(&db, payment).await {
+                    error!(payment_id = %payment.id, error = %e, "Failed to process payment");
                 }
             }
         }
     });
 }
 
+#[instrument(skip(db, p), fields(payment_id = %p.id))]
 async fn process(db: &Db, p: &Payment) -> Result<()> {
     // First check confirmations
     let hist = crate::electrum::rpc(
@@ -64,7 +75,9 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     let tip = hdr["height"].as_u64().unwrap_or(0);
 
     // For a single-payment address, min block height across all txs in history is enough
-    let confirmations = hist.as_array().unwrap()
+    let confirmations = hist
+        .as_array()
+        .unwrap()
         .iter()
         .filter(|h| h["height"].as_u64().unwrap_or(0) > 0)
         .map(|h| tip - h["height"].as_u64().unwrap() + 1)
@@ -76,8 +89,10 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         .parse::<u64>()
         .unwrap_or(2);
 
+    debug!(confirmations, needed, "Checking confirmations");
     if confirmations < needed {
         // Not enough confirmations yet; skip
+        debug!("Not enough confirmations yet");
         return Ok(());
     }
 
@@ -87,7 +102,11 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         &[script_hash(&p.address).into()],
     )?;
     let target_sat = (p.amount * 1e8) as u64;
-    if bal["confirmed"].as_u64().unwrap_or(0) < target_sat {
+    let confirmed_balance = bal["confirmed"].as_u64().unwrap_or(0);
+
+    debug!(confirmed_balance, target_sat, "Checking balance");
+    if confirmed_balance < target_sat {
+        debug!("Balance insufficient");
         return Ok(());
     }
 
@@ -126,7 +145,10 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     }
 
     let fee = crate::electrum::fee_sat(tx.vsize() as u64 + 68);
-    if total <= fee { return Ok(()); }
+    if total <= fee {
+        debug!(total, fee, "Total less than or equal to fee, skipping");
+        return Ok(());
+    }
     tx.output[0].value = total - fee;
 
     let sk_hex = decrypt_wif(&p.wif_enc);
@@ -134,6 +156,7 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     let secp = Secp256k1::new();
     let pk = PublicKey::from_secret_key(&secp, &sk);
 
+    debug!(inputs = tx.input.len(), "Signing transaction");
     for (i, prev_value) in prev_values.iter().enumerate() {
         let script_code = p2pkh_script_code(&pk);
         let sighash = {
@@ -151,7 +174,8 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         "blockchain.transaction.broadcast",
         &[hex::encode(tx.serialize()).into()],
     )?;
-    println!("[Sweeper] {} broadcast {}", p.id, txid);
-    db.mark_completed(&p.id);
+
+    info!(txid = %txid, total_amount = total - fee, "Transaction broadcast successfully");
+    let _ = db.mark_completed(&p.id);
     Ok(())
 }

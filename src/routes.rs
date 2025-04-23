@@ -7,9 +7,10 @@ use actix_web::{web, HttpResponse};
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
+use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct PayReq {
     amount: f64,
 }
@@ -19,14 +20,21 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         .service(web::resource("/payments/{id}").route(web::get().to(get_payment)));
 }
 
+#[instrument(skip(db))]
 async fn create_payment(db: web::Data<Db>, req: web::Json<PayReq>) -> HttpResponse {
     if req.amount <= 0.0 {
+        debug!(
+            "Rejected payment request with invalid amount: {}",
+            req.amount
+        );
         return HttpResponse::BadRequest().finish();
     }
+
     let id = Uuid::new_v4().to_string();
     let (_, wif, addr) = new_key();
     let wif_enc = encrypt_wif(&wif);
-    db.insert(&Payment {
+
+    let payment = Payment {
         id: id.clone(),
         address: addr.clone(),
         wif_enc,
@@ -34,32 +42,57 @@ async fn create_payment(db: web::Data<Db>, req: web::Json<PayReq>) -> HttpRespon
         status: "pending".into(),
         created_at: 0,
         updated_at: 0,
-    });
+    };
+
+    let _ = db.insert(&payment);
+    info!("Created new payment: id={}, address={}", id, addr);
+
     HttpResponse::Ok().json(json!({ "id": id, "address": addr, "amount": req.amount }))
 }
 
+#[instrument(skip(db))]
 async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse {
-    let Some(p) = db.find(&path) else {
+    let payment_id = path.into_inner();
+    debug!("Looking up payment with id: {}", payment_id);
+
+    let Ok(Some(payment)) = db.find(&payment_id) else {
+        debug!("Payment not found: {}", payment_id);
         return HttpResponse::NotFound().finish();
     };
 
+    debug!(
+        "Fetching blockchain information for address: {}",
+        payment.address
+    );
+
     let bal = match rpc(
         "blockchain.scripthash.get_balance",
-        &[script_hash(&p.address).into()],
+        &[script_hash(&payment.address).into()],
     ) {
         Ok(v) => v,
-        Err(_) => return HttpResponse::BadGateway().body("electrum error"),
+        Err(e) => {
+            error!("Electrum error getting balance: {:?}", e);
+            return HttpResponse::BadGateway().body("electrum error");
+        }
     };
+
     let hdr = match rpc("blockchain.headers.subscribe", &[]) {
         Ok(v) => v,
-        Err(_) => return HttpResponse::BadGateway().body("electrum error"),
+        Err(e) => {
+            error!("Electrum error subscribing to headers: {:?}", e);
+            return HttpResponse::BadGateway().body("electrum error");
+        }
     };
+
     let hist = match rpc(
         "blockchain.scripthash.get_history",
-        &[script_hash(&p.address).into()],
+        &[script_hash(&payment.address).into()],
     ) {
         Ok(v) => v,
-        Err(_) => return HttpResponse::BadGateway().body("electrum error"),
+        Err(e) => {
+            error!("Electrum error getting history: {:?}", e);
+            return HttpResponse::BadGateway().body("electrum error");
+        }
     };
 
     let tip = hdr["height"].as_u64().unwrap_or(0);
@@ -82,13 +115,18 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
         .parse::<u64>()
         .unwrap_or(2);
 
+    info!(
+        "Payment info: id={}, address={}, confirmations={}/{}",
+        payment.id, payment.address, confirmations, confirmations_needed
+    );
+
     HttpResponse::Ok().json(json!({
-        "id": p.id,
-        "address": p.address,
-        "amount": p.amount,
-        "status": p.status,
-        "created_at": p.created_at,
-        "updated_at": p.updated_at,
+        "id": payment.id,
+        "address": payment.address,
+        "amount": payment.amount,
+        "status": payment.status,
+        "created_at": payment.created_at,
+        "updated_at": payment.updated_at,
         "confirmations": confirmations,
         "confirmations_needed": confirmations_needed,
         "received": received,
