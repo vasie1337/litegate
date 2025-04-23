@@ -33,7 +33,7 @@ Variable | Purpose
 `ELECTRUM_HOST / PORT` | Upstream Electrum daemon  
 `CONFIRMATIONS` | Blocks required before sweeping (default 2)  
 `DB_FILE` | SQLite path (default `payments.db`)  
-`PORT` | HTTP port (default 3000)
+`PORT` | HTTP port (default 8000)
 
 Copy `.env.sample`, fill in real values, then:
 
