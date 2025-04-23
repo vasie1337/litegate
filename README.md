@@ -5,6 +5,11 @@ A minimal Rust + Actix-Web service that issues generated single-use Litecoin (LT
 
 ![LiteGate Banner](./assets/banner.png)
 
+<div align="center" style="display: flex; gap: 10px;">
+  <img src="./assets/preview-create.png" alt="Create Payment Preview" width="48%">
+  <img src="./assets/preview-pay.png" alt="Payment Status Preview" width="48%">
+</div>
+
 ## 1 • High-level Architecture
 
 ```

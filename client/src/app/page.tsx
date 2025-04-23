@@ -1,12 +1,10 @@
 'use client'
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Clock, ArrowRight, Info, Check, CreditCard, AlertTriangle } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 
-// Constants
 const API = process.env.NEXT_PUBLIC_API_URL
-const LITECOIN_PRICE = 83.45 // Simulated LTC price in USD
 const EXPIRATION_OPTIONS = [
   { label: '15m', value: '900' },
   { label: '1h', value: '3600' },
