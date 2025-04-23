@@ -3,18 +3,7 @@ use electrum_client::{Client, ConfigBuilder, ElectrumApi, Param};
 use lazy_static::lazy_static;
 use serde_json::Value;
 use std::{sync::Mutex, thread, time::Duration};
-use tracing::{debug, error, info, trace, Level};
-
-/// Initialize tracing subscriber once.
-fn init_tracing() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .with_timer(tracing_subscriber::fmt::time::time())
-            .init();
-    });
-}
+use tracing::{debug, error, info, trace};
 
 /// Open a single connection (`scheme://host:port`) and perform `server.version`.
 fn connect_once(host: &str, port: &str, scheme: &str) -> Result<Client> {
@@ -66,7 +55,6 @@ lazy_static! {
 }
 
 fn client() -> Result<&'static Mutex<Option<Client>>> {
-    init_tracing();
     if ECL.lock().unwrap().is_none() {
         *ECL.lock().unwrap() = Some(fresh_client()?);
     }
