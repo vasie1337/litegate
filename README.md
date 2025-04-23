@@ -1,7 +1,9 @@
 
-# LTC Payment Gateway
+# LiteGate
 
 A minimal Rust + Actix-Web service that issues generated single-use Litecoin (LTC) deposit addresses, tracks incoming payments through an Electrum server, and automatically sweeps confirmed funds into a cold wallet.
+
+![LiteGate Banner](./assets/banner.png)
 
 ## 1 • High-level Architecture
 
@@ -22,8 +24,6 @@ A minimal Rust + Actix-Web service that issues generated single-use Litecoin (LT
 * **sweeper.rs** – background worker that “ticks” every 10 s, detects confirmed funds and constructs a sweeping transaction  
 * **utils.rs** – key-gen, Bech32 address helpers, AES-GCM encryption for the private key (WIF)
 
----
-
 ## 2 • Environment
 
 Variable | Purpose
@@ -40,8 +40,6 @@ Copy `.env.sample`, fill in real values, then:
 ```bash
 cargo run --release
 ```
-
----
 
 ## 3 • API Flows
 
@@ -73,8 +71,6 @@ cargo run --release
   * **All** coins on the deposit address (over-payment included) are forwarded to `MAIN_ADDRESS`.
 
 
----
-
 ## 4 • Internal Tick System
 
 * A single Tokio task (`sweeper::start`) runs forever.  
@@ -92,8 +88,6 @@ else            ──▶ hot scan only
 
 This keeps pending invoices very responsive while preventing useless RPC spam for already-handled ones.
 
----
-
 ## 5 • Payment States
 
 State | Meaning | Transition
@@ -101,8 +95,6 @@ State | Meaning | Transition
 `pending` | Address issued, waiting for funds | → `expired` (TTL up) / `completed` (swept)
 `expired` | TTL passed with < needed confirmations | terminal
 `completed` | Funds swept to cold wallet | terminal
-
----
 
 ## 6 • Database Schema
 
@@ -122,15 +114,11 @@ CREATE INDEX idx_payments_expires_at ON payments(expires_at);
 
 (All timestamps are Unix seconds.)
 
----
-
 ## 7 • Security Notes
 
 * Private key (WIF) only ever touches disk encrypted (AES-256-GCM).  
 * Sweeper decrypts the WIF in-memory just long enough to sign the sweep.  
 * No incoming ports; all chain data fetched via Electrum over TCP/TLS.  
-
----
 
 ## 8 • What to Expect
 

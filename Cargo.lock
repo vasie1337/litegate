@@ -1128,6 +1128,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "litegate"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "aead",
+ "aes-gcm",
+ "anyhow",
+ "bech32 0.9.1",
+ "bitcoin 0.28.2",
+ "dotenvy",
+ "electrum-client",
+ "env_logger",
+ "hex",
+ "lazy_static",
+ "log",
+ "once_cell",
+ "rand 0.8.5",
+ "ripemd",
+ "rusqlite",
+ "secp256k1 0.24.3",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "litemap"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1165,37 +1196,6 @@ name = "log"
 version = "0.4.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
-
-[[package]]
-name = "ltcpayment"
-version = "0.1.0"
-dependencies = [
- "actix-web",
- "aead",
- "aes-gcm",
- "anyhow",
- "bech32 0.9.1",
- "bitcoin 0.28.2",
- "dotenvy",
- "electrum-client",
- "env_logger",
- "hex",
- "lazy_static",
- "log",
- "once_cell",
- "rand 0.8.5",
- "ripemd",
- "rusqlite",
- "secp256k1 0.24.3",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
 
 [[package]]
 name = "memchr"

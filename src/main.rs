@@ -11,15 +11,27 @@ use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-
     // Load environment variables
     dotenv().ok();
     info!("Starting application");
+
+    // Initialize tracing
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(
+            match env::var("LOG_LEVEL")
+                .unwrap_or_else(|_| "INFO".into())
+                .to_uppercase()
+                .as_str()
+            {
+                "TRACE" => Level::TRACE,
+                "DEBUG" => Level::DEBUG,
+                "WARN" => Level::WARN,
+                "ERROR" => Level::ERROR,
+                _ => Level::INFO,
+            },
+        )
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
     // Get port from environment or use default
     let port: u16 = env::var("PORT")
