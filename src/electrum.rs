@@ -86,7 +86,7 @@ fn to_params(v: &[Value]) -> Vec<Param> {
     v.iter().map(json_param).collect()
 }
 
-/// RPC wrapper with verbose logs + automatic reconnect.
+/// Synchronous RPC wrapper with verbose logs + automatic reconnect.
 pub fn rpc(method: &str, params: &[Value]) -> Result<Value> {
     for attempt in 1..=3 {
         let lock = client()?;
@@ -115,7 +115,7 @@ pub fn rpc(method: &str, params: &[Value]) -> Result<Value> {
     bail!("rpc fail after 3 attempts (method='{method}')")
 }
 
-/// vsize × sat/vB via `blockchain.estimatefee`.
+/// Synchronous vsize × sat/vB via `blockchain.estimatefee`.
 pub fn fee_sat(vsize: u64) -> u64 {
     let est = rpc("blockchain.estimatefee", &[Value::from(6)])
         .unwrap_or(Value::from(0.0))
@@ -124,4 +124,20 @@ pub fn fee_sat(vsize: u64) -> u64 {
 
     let sat_per_vb = ((est * 1e8) / 1000.0).ceil() as u64;
     vsize * sat_per_vb.max(1)
+}
+
+/// **Async** wrapper around `rpc`, executed in a dedicated blocking thread.
+pub async fn rpc_async(method: &str, params: &[Value]) -> Result<Value> {
+    let method_owned = method.to_owned();
+    let params_vec: Vec<Value> = params.iter().cloned().collect();
+    tokio::task::spawn_blocking(move || rpc(&method_owned, &params_vec))
+        .await
+        .map_err(|e| anyhow!("join error: {}", e))?
+}
+
+/// **Async** wrapper around `fee_sat`, executed in a blocking thread.
+pub async fn fee_sat_async(vsize: u64) -> u64 {
+    tokio::task::spawn_blocking(move || fee_sat(vsize))
+        .await
+        .unwrap_or(vsize) // fall back to vsize × 1 sat/vB on join error
 }

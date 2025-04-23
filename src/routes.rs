@@ -1,12 +1,13 @@
 use crate::{
     db::{Db, Payment},
-    electrum::rpc,
+    electrum::rpc_async,
     utils::{encrypt_wif, new_key, script_hash},
 };
 use actix_web::{web, HttpResponse};
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
+use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
 
@@ -44,9 +45,18 @@ async fn create_payment(db: web::Data<Db>, req: web::Json<PayReq>) -> HttpRespon
         updated_at: 0,
     };
 
-    let _ = db.insert(&payment);
-    info!("Created new payment: id={}, address={}", id, addr);
+    // DB insert offloaded to blocking thread
+    let db_clone = db.clone();
+    let payment_clone = payment.clone();
+    if let Err(e) = spawn_blocking(move || db_clone.insert(&payment_clone))
+        .await
+        .expect("blocking task panicked")
+    {
+        error!("DB insert error: {}", e);
+        return HttpResponse::InternalServerError().finish();
+    }
 
+    info!("Created new payment: id={}, address={}", id, addr);
     HttpResponse::Ok().json(json!({ "id": id, "address": addr, "amount": req.amount }))
 }
 
@@ -55,7 +65,22 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
     let payment_id = path.into_inner();
     debug!("Looking up payment with id: {}", payment_id);
 
-    let Ok(Some(payment)) = db.find(&payment_id) else {
+    // DB lookup offloaded to blocking thread
+    let db_clone = db.clone();
+    let payment_id_clone = payment_id.clone();
+    let payment_res = spawn_blocking(move || db_clone.find(&payment_id_clone))
+        .await
+        .expect("blocking task panicked");
+
+    let payment_opt = match payment_res {
+        Ok(p) => p,
+        Err(e) => {
+            error!("DB lookup error: {}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    let Some(payment) = payment_opt else {
         debug!("Payment not found: {}", payment_id);
         return HttpResponse::NotFound().finish();
     };
@@ -65,10 +90,12 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
         payment.address
     );
 
-    let bal = match rpc(
+    let bal = match rpc_async(
         "blockchain.scripthash.get_balance",
         &[script_hash(&payment.address).into()],
-    ) {
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             error!("Electrum error getting balance: {:?}", e);
@@ -76,7 +103,7 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
         }
     };
 
-    let hdr = match rpc("blockchain.headers.subscribe", &[]) {
+    let hdr = match rpc_async("blockchain.headers.subscribe", &[]).await {
         Ok(v) => v,
         Err(e) => {
             error!("Electrum error subscribing to headers: {:?}", e);
@@ -84,10 +111,12 @@ async fn get_payment(db: web::Data<Db>, path: web::Path<String>) -> HttpResponse
         }
     };
 
-    let hist = match rpc(
+    let hist = match rpc_async(
         "blockchain.scripthash.get_history",
         &[script_hash(&payment.address).into()],
-    ) {
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             error!("Electrum error getting history: {:?}", e);

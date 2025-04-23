@@ -1,5 +1,6 @@
 use crate::{
     db::{Db, Payment},
+    electrum::{fee_sat_async, rpc_async},
     utils::{decrypt_wif, script_hash},
 };
 use anyhow::Result;
@@ -67,11 +68,12 @@ pub async fn start(db: Db) {
 #[instrument(skip(db, p), fields(payment_id = %p.id))]
 async fn process(db: &Db, p: &Payment) -> Result<()> {
     // First check confirmations
-    let hist = crate::electrum::rpc(
+    let hist = rpc_async(
         "blockchain.scripthash.get_history",
         &[script_hash(&p.address).into()],
-    )?;
-    let hdr = crate::electrum::rpc("blockchain.headers.subscribe", &[])?;
+    )
+    .await?;
+    let hdr = rpc_async("blockchain.headers.subscribe", &[]).await?;
     let tip = hdr["height"].as_u64().unwrap_or(0);
 
     // For a single-payment address, min block height across all txs in history is enough
@@ -97,10 +99,11 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     }
 
     // Now check if the confirmed balance meets or exceeds `p.amount`
-    let bal = crate::electrum::rpc(
+    let bal = rpc_async(
         "blockchain.scripthash.get_balance",
         &[script_hash(&p.address).into()],
-    )?;
+    )
+    .await?;
     let target_sat = (p.amount * 1e8) as u64;
     let confirmed_balance = bal["confirmed"].as_u64().unwrap_or(0);
 
@@ -111,10 +114,11 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
     }
 
     // Collect UTXOs and sweep
-    let utxos = crate::electrum::rpc(
+    let utxos = rpc_async(
         "blockchain.scripthash.listunspent",
         &[script_hash(&p.address).into()],
-    )?;
+    )
+    .await?;
 
     let main_address = env::var("MAIN_ADDRESS").expect("MAIN_ADDRESS must be set");
     let main_script = addr_to_script(&main_address);
@@ -144,7 +148,7 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         });
     }
 
-    let fee = crate::electrum::fee_sat(tx.vsize() as u64 + 68);
+    let fee = fee_sat_async(tx.vsize() as u64 + 68).await;
     if total <= fee {
         debug!(total, fee, "Total less than or equal to fee, skipping");
         return Ok(());
@@ -170,10 +174,11 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         tx.input[i].witness.push(pk.serialize().to_vec());
     }
 
-    let txid = crate::electrum::rpc(
+    let txid = rpc_async(
         "blockchain.transaction.broadcast",
         &[hex::encode(tx.serialize()).into()],
-    )?;
+    )
+    .await?;
 
     info!(txid = %txid, total_amount = total - fee, "Transaction broadcast successfully");
     let _ = db.mark_completed(&p.id);
