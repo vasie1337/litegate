@@ -17,3 +17,4 @@ pub mod electrum;
 pub mod routes;
 pub mod sweeper;
 pub mod utils;
+pub mod webhook;

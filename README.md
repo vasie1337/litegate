@@ -1,4 +1,3 @@
-
 # LiteGate
 
 A minimal Rust + Actix-Web service that issues generated single-use Litecoin (LTC) deposit addresses, tracks incoming payments through an Electrum server, and automatically sweeps confirmed funds into a cold wallet.
@@ -21,13 +20,19 @@ A minimal Rust + Actix-Web service that issues generated single-use Litecoin (LT
                              ├──────────────┤
  Electrum  ⇆ electrum.rs ⇆   │ sweeper.rs   │ ⇆ Litecoin network
  server                      └──────────────┘
+                                    │
+                                    ▼
+                             ┌──────────────┐
+                             │  webhook.rs  │ → External Services
+                             └──────────────┘
 ```
 
 * **/src/routes.rs** – small REST surface (`POST /payments`, `GET /payments/{id}`)  
 * **db.rs** – SQLite wrapper (table **payments**)  
 * **electrum.rs** – thin Electrum RPC pool (no full node needed)  
-* **sweeper.rs** – background worker that “ticks” every 10 s, detects confirmed funds and constructs a sweeping transaction  
+* **sweeper.rs** – background worker that "ticks" every 10 s, detects confirmed funds and constructs a sweeping transaction  
 * **utils.rs** – key-gen, Bech32 address helpers, AES-GCM encryption for the private key (WIF)
+* **webhook.rs** – sends secure notifications when payments are completed
 
 ## 2 • Environment
 
@@ -39,6 +44,8 @@ Variable | Purpose
 `CONFIRMATIONS` | Blocks required before sweeping (default 2)  
 `DB_FILE` | SQLite path (default `payments.db`)  
 `PORT` | HTTP port (default 8000)
+`WEBHOOK_URL` | URL to send completion notifications to
+`WEBHOOK_SECRET` | Secret key for signing webhook payloads
 
 Copy `.env.sample`, fill in real values, then:
 
@@ -57,6 +64,7 @@ cargo run --release
 | ③ Poll status | `GET /payments/{id}` | `{ "status":"pending", "confirmations":1, "received":0.5 }` |
 | ④ ≥ 2 confs reached | automatic | record in DB marked **completed** |
 | ⑤ Sweep | sweeper builds a tx → broadcasts → funds arrive in `MAIN_ADDRESS` |
+| ⑥ Webhook | system sends webhook notification to `WEBHOOK_URL` |
 
 ### 3.2 Expired / unpaid
 
@@ -124,9 +132,99 @@ CREATE INDEX idx_payments_expires_at ON payments(expires_at);
 * Private key (WIF) only ever touches disk encrypted (AES-256-GCM).  
 * Sweeper decrypts the WIF in-memory just long enough to sign the sweep.  
 * No incoming ports; all chain data fetched via Electrum over TCP/TLS.  
+* Webhook payloads are signed with HMAC-SHA256 for security verification.
 
-## 8 • What to Expect
+## 8 • Webhook System
+
+The webhook system notifies external services when a payment is successfully completed and swept.
+
+### 8.1 Configuration
+
+To enable webhooks, set these environment variables:
+
+```
+WEBHOOK_URL=https://your-service.com/callback
+WEBHOOK_SECRET=your-secure-secret-key
+```
+
+- If `WEBHOOK_URL` is not provided or empty, no webhooks will be sent.
+- `WEBHOOK_SECRET` is used to generate HMAC signatures for security.
+
+### 8.2 Webhook Payload Structure
+
+When a payment status changes to `completed`, a POST request is sent to the webhook URL with this payload:
+
+```json
+{
+  "event": "payment.completed",
+  "payment": {
+    "id": "a1b2c3d4-e5f6-...",
+    "address": "ltc1...",
+    "amount": 0.5,
+    "status": "completed",
+    "created_at": 1713874123,
+    "updated_at": 1713875023,
+    "expires_at": 1713878023
+  }
+}
+```
+
+### 8.3 Webhook Authentication
+
+Each webhook is signed with an HMAC-SHA256 signature using your `WEBHOOK_SECRET`. The signature is sent in the `X-Signature` HTTP header.
+
+To verify the webhook's authenticity:
+
+1. Get the raw request body as a string
+2. Get the signature from the `X-Signature` header
+3. Calculate the HMAC-SHA256 of the raw body using your secret key
+4. Compare the calculated signature with the received one
+
+Example verification code in Node.js:
+
+```javascript
+const crypto = require('crypto');
+
+function verifyWebhook(body, signature, secret) {
+  const computedSignature = crypto
+    .createHmac('sha256', secret)
+    .update(body)
+    .digest('hex');
+  
+  return crypto.timingSafeEqual(
+    Buffer.from(computedSignature, 'hex'),
+    Buffer.from(signature, 'hex')
+  );
+}
+
+// In your Express handler:
+app.post('/callback', (req, res) => {
+  const signature = req.headers['x-signature'];
+  const rawBody = req.rawBody; // You'll need raw body middleware
+  
+  if (!verifyWebhook(rawBody, signature, process.env.WEBHOOK_SECRET)) {
+    return res.status(401).send('Invalid signature');
+  }
+  
+  // Process the webhook
+  const data = JSON.parse(rawBody);
+  console.log(`Payment ${data.payment.id} completed!`);
+  
+  res.status(200).send('OK');
+});
+```
+
+### 8.4 Security Best Practices
+
+- Use HTTPS for your webhook endpoint
+- Keep your webhook secret secure and don't share it
+- Implement signature verification to prevent forgery
+- Add request timeout handling in your webhook receiver
+- Consider implementing retry logic for failed webhook deliveries
+
+## 9 • What to Expect
 
 * **10-second latency** on invoice updates; **≈ 1–3 min** until sweep after required confirmations.  
 * If Electrum is down the gateway continues issuing addresses; sweeper resumes when connectivity is back.  
 * The service is *stateless* beyond `payments.db`; you can safely redeploy or run multiple front-end instances pointing to the same DB.
+* Webhooks are sent immediately after a payment is marked as completed.

@@ -2,6 +2,7 @@ use crate::{
     db::{Db, Payment},
     electrum::{fee_sat_async, rpc_async},
     utils::{decrypt_wif, script_hash},
+    webhook::send_completion_webhook,
 };
 use anyhow::Result;
 use bech32::{decode, FromBase32};
@@ -24,6 +25,7 @@ use tokio::{
     spawn,
     time::{interval, Duration},
 };
+use tracing::error;
 
 fn addr_to_script(addr: &str) -> Script {
     let (_, data, _) = decode(addr).unwrap();
@@ -171,6 +173,14 @@ async fn process(db: &Db, p: &Payment) -> Result<()> {
         &[hex::encode(tx.serialize()).into()],
     )
     .await?;
+    
     db.mark_completed(&p.id)?;
+    
+    if let Ok(Some(updated_payment)) = db.find(&p.id) {
+        if let Err(e) = send_completion_webhook(&updated_payment).await {
+            error!(payment_id = %p.id, error = %e, "Failed to send webhook");
+        }
+    }
+    
     Ok(())
 }
