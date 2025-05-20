@@ -2,6 +2,14 @@ FROM rust:slim-bullseye as builder
 
 WORKDIR /usr/src/app
 
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl1.1 \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create a dummy project with the Cargo.toml and Cargo.lock
 COPY Cargo.toml Cargo.lock ./
 
@@ -19,7 +27,7 @@ RUN touch src/main.rs && \
     cargo build --release
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:bullseye-slim
 
 WORKDIR /app
 
@@ -27,7 +35,7 @@ WORKDIR /app
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl-dev \
+    libssl1.1 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
