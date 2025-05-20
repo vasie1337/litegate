@@ -5,6 +5,7 @@ mod sweeper;
 mod utils;
 mod webhook;
 use actix_web::{App, HttpServer};
+use actix_cors::Cors;
 use dotenvy::dotenv;
 use std::env;
 use tracing::{info, Level};
@@ -48,6 +49,13 @@ async fn main() -> std::io::Result<()> {
     info!("Starting HTTP server on 0.0.0.0:{}", port);
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .max_age(3600)
+            )
             .app_data(actix_web::web::Data::new(db.clone()))
             .configure(routes::config)
     })
